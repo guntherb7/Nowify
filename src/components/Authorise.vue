@@ -22,6 +22,7 @@
 
 <script>
 import props from '@/utils/props.js'
+import { setStoredAuth } from '@/utils/utils.js'
 
 const searchParams = new URLSearchParams()
 const currentParams = new URLSearchParams(window.location.search)
@@ -125,9 +126,19 @@ export default {
      */
     handleAccessTokenResponse(accessTokenResponse = {}) {
       /**
-       * Auth token expired.
+       * Refresh token is expired, revoked, or otherwise invalid. The Spotify
+       * token endpoint returns a flat `{ error: 'invalid_grant' }` (a string,
+       * not an object). Discard the stored tokens and fall back to the login
+       * screen instead of retrying — a refresh can never recover from this, so
+       * the user must sign in again (Spotify's 6-month refresh-token policy).
        */
-      if (accessTokenResponse.error?.error === 'invalid_grant') {
+      if (accessTokenResponse.error === 'invalid_grant') {
+        this.auth.accessToken = ''
+        this.auth.refreshToken = ''
+        this.auth.authCode = ''
+        this.auth.status = false
+        setStoredAuth(this.auth)
+
         return
       }
 

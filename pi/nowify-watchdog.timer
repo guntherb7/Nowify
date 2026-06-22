@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the Nowify kiosk watchdog every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=nowify-watchdog.service
+
+[Install]
+WantedBy=timers.target
