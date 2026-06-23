@@ -135,7 +135,13 @@ def inject_qr(ws, svg, caption):
       "d.appendChild(line('Spotify sign-in needed','30px','1','16px'));"
       "d.appendChild(line('Scan to sign in from your phone','18px','0.8','24px'));"
       "d.appendChild(q);"
-      "d.appendChild(line(cap,'14px','0.55','0'));"
+      "d.appendChild(line(cap,'14px','0.55','18px'));"
+      "var btn=document.createElement('button');"
+      "btn.textContent='I am signing in \\u2192';"
+      "btn.style.padding='12px 20px'; btn.style.fontSize='15px'; btn.style.border='0';"
+      "btn.style.borderRadius='22px'; btn.style.background='#1db954'; btn.style.color='#fff';"
+      "btn.onclick=function(){try{localStorage.setItem('nowify_qr_dismissed',String(Date.now()));}catch(e){} d.remove();};"
+      "d.appendChild(btn);"
       "document.body.appendChild(d); return 'ok';"
       "})(" + json.dumps(svg) + "," + json.dumps(caption) + ")")
     return cdp_eval(ws, js)
@@ -157,6 +163,22 @@ def show_qr(ws):
     except Exception as e:
         log("QR inject failed (%s)" % e)
 
+def maybe_show_qr(ws):
+    # Don't re-cover the screen if the QR is already up, or if the user dismissed
+    # it recently (they're signing in via noVNC and need the form unobscured).
+    try:
+        g = json.loads(cdp_eval(ws,
+            "(function(){var o=!!document.getElementById('nowify-qr-overlay');"
+            "var d=parseInt(localStorage.getItem('nowify_qr_dismissed')||'0',10);"
+            "return JSON.stringify({o:o,recent:!!(d&&(Date.now()-d)<1200000)});})()") or "{}")
+    except Exception:
+        g = {}
+    if g.get("o"):
+        log("QR already shown"); return
+    if g.get("recent"):
+        log("QR dismissed recently — leaving form visible"); return
+    show_qr(ws)
+
 def restart_chromium():
     log("restarting chromium"); subprocess.run(RESTART_CMD, shell=True)
 
@@ -177,7 +199,7 @@ def main():
         log("after click: state = %s" % st)
 
     if st == "spotify_login":
-        show_qr(ws); _wc(RESTART_COUNT, 0); return 0
+        maybe_show_qr(ws); _wc(RESTART_COUNT, 0); return 0
 
     if st == "healthy":
         _wc(RESTART_COUNT, 0); return 0
