@@ -1,157 +1,193 @@
 #!/usr/bin/env python3
 """
-Nowify kiosk watchdog.
+Nowify kiosk watchdog (v2) — keyboard-free recovery.
 
-Reads Nowify's auth state out of the running Chromium kiosk via the DevTools
-Protocol (no changes to the Nowify app required) and decides whether a restart
-would actually help:
+Reads kiosk state via the Chromium DevTools Protocol and acts:
 
-  - logged in / playing            -> healthy, do nothing
-  - NOT logged in, refreshToken    -> transient (browser hung, network blip at
-    still present                      boot, mid-refresh). A restart fixes this.
-  - NOT logged in, NO refreshToken -> refresh token expired/revoked. A restart
-                                      CANNOT fix this; it needs a human to click
-                                      "Login with Spotify" once. Do nothing, so
-                                      we never get into a reboot/restart loop.
+  healthy            logged in / playing                 -> nothing
+  nowify_loggedout   on the Nowify login screen, refresh -> AUTO RE-LOGIN: click
+                     token gone (Spotify policy)            "Login with Spotify".
+                                                            Works with no human as
+                                                            long as the Pi is still
+                                                            signed into Spotify.
+  spotify_login      kicked out to Spotify's own login   -> overlay a QR pointing at
+                     page (Spotify session also expired)    the on-Pi login server, so
+                                                            the phone can type creds.
+  transient/unreach  browser hung / crashed              -> restart Chromium after
+                                                            FAIL_THRESHOLD checks.
 
-Only restarts after FAIL_THRESHOLD consecutive bad checks, so a single check
-landing mid-refresh doesn't cause a needless restart.
+Never loop-restarts Chromium on a logged-out/expired state — those are handled
+by auto-login or the QR, not by reboots.
 
-Requires: python3 + websocket-client  (sudo apt install python3-websocket
-or: pip3 install websocket-client). Chromium must be launched with
-  --remote-debugging-port=9222
+Deps: python3-websocket, python3-qrcode. Chromium must run with
+  --remote-debugging-port=9222 --remote-allow-origins=*
 """
 
-import json
-import os
-import subprocess
-import sys
-import urllib.request
+import json, os, socket, subprocess, sys, time, urllib.request
 
-# --- config (env overrides) --------------------------------------------------
-DEBUG_PORT = int(os.environ.get("NOWIFY_DEBUG_PORT", "9222"))
-# Substring used to pick the Nowify tab if several are open. Matched against the
-# tab url+title, lowercased. Leave as "nowify" or set to your host/port.
-APP_HINT = os.environ.get("NOWIFY_APP_HINT", "nowify").lower()
-# Shell command that relaunches the Chromium kiosk. REQUIRED — set per setup.
-# Examples:
-#   systemd system service: "sudo systemctl restart nowify-kiosk"
-#   systemd user service:   "systemctl --user restart nowify-kiosk"
-#   X/autostart (no svc):   "pkill -f chromium; sleep 2; <full chromium cmd> &"
-RESTART_CMD = os.environ.get("NOWIFY_RESTART_CMD", "")
-# Consecutive bad checks before we act (with a 5-min timer that's ~15 min).
-FAIL_THRESHOLD = int(os.environ.get("NOWIFY_FAIL_THRESHOLD", "3"))
-STATE_FILE = os.environ.get("NOWIFY_STATE_FILE", "/tmp/nowify-watchdog.count")
-# -----------------------------------------------------------------------------
+DEBUG_PORT = 9222
+NOVNC_PORT = 6080
+NOVNC_PW_FILE = os.path.expanduser("~/.vnc/novnc_pw.txt")
+APP_HINT = "nowify"
+FAIL_THRESHOLD = 3
+APP_URL = "https://scintillating-boba-a9f143.netlify.app/"
+RESTART_CMD = ("pkill -f chromium-browser; sleep 2; "
+    "/usr/bin/chromium-browser --force-renderer-accessibility "
+    "--enable-remote-extensions --enable-pinch "
+    "--remote-debugging-port=9222 --remote-allow-origins=* "
+    "--kiosk %s >/dev/null 2>&1 &" % APP_URL)
+RESTART_COUNT = os.path.expanduser("~/.nowify-watchdog.count")
 
 
-def log(msg):
-    print(f"[nowify-watchdog] {msg}", flush=True)
+def log(m): print("[nowify-watchdog]", m, flush=True)
 
+def _rc(path):
+    try: return int(open(path).read().strip())
+    except Exception: return 0
 
-def read_count():
+def _wc(path, n):
+    try: open(path, "w").write(str(n))
+    except Exception as e: log("count write failed: %s" % e)
+
+def lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        return int(open(STATE_FILE).read().strip())
+        s.connect(("8.8.8.8", 80)); return s.getsockname()[0]
     except Exception:
-        return 0
+        return "127.0.0.1"
+    finally:
+        s.close()
 
+def cdp_pages():
+    data = json.load(urllib.request.urlopen("http://localhost:%d/json" % DEBUG_PORT, timeout=5))
+    return [t for t in data if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
 
-def write_count(n):
-    try:
-        open(STATE_FILE, "w").write(str(n))
-    except Exception as e:
-        log(f"could not write state file: {e}")
-
-
-def cdp_page_ws():
-    """Return the websocket debugger URL for the Nowify tab, or None."""
-    data = json.load(urllib.request.urlopen(f"http://localhost:{DEBUG_PORT}/json", timeout=5))
-    pages = [t for t in data if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
-    if not pages:
-        return None
+def pick(pages):
     for t in pages:
-        if APP_HINT in (t.get("url", "") + " " + t.get("title", "")).lower():
-            return t["webSocketDebuggerUrl"]
-    return pages[0]["webSocketDebuggerUrl"]
+        u = (t.get("url","") + " " + t.get("title","")).lower()
+        if "accounts.spotify.com" in u or APP_HINT in u:
+            return t["webSocketDebuggerUrl"], t.get("url","")
+    return pages[0]["webSocketDebuggerUrl"], pages[0].get("url","")
 
-
-def cdp_eval(ws_url, expression):
-    from websocket import create_connection  # imported late so missing dep is a clear error
-
-    ws = create_connection(ws_url, timeout=5)
+def cdp_eval(ws_url, expr):
+    from websocket import create_connection
+    ws = create_connection(ws_url, timeout=6)
     try:
-        ws.send(json.dumps({
-            "id": 1,
-            "method": "Runtime.evaluate",
-            "params": {"expression": expression, "returnByValue": True},
-        }))
+        ws.send(json.dumps({"id":1,"method":"Runtime.evaluate",
+            "params":{"expression":expr,"returnByValue":True}}))
         while True:
-            msg = json.loads(ws.recv())
-            if msg.get("id") == 1:
-                return msg.get("result", {}).get("result", {}).get("value")
+            m = json.loads(ws.recv())
+            if m.get("id") == 1:
+                return m.get("result",{}).get("result",{}).get("value")
     finally:
         ws.close()
 
-
-def get_state():
-    """
-    Returns one of: 'healthy', 'transient', 'expired', 'unreachable'.
-    """
+def detect():
     try:
-        ws = cdp_page_ws()
+        pages = cdp_pages()
     except Exception as e:
-        log(f"Chromium DevTools not reachable on :{DEBUG_PORT} ({e}) -> unreachable")
-        return "unreachable"
-
-    if not ws:
-        log("No Chromium page target found -> unreachable")
-        return "unreachable"
-
-    expr = (
-        "JSON.stringify((function(){"
-        "try{var a=JSON.parse(localStorage.getItem('nowify_auth_state')||'{}');"
-        "return{status:!!a.status,hasRefresh:!!a.refreshToken};}"
-        "catch(e){return{status:false,hasRefresh:false};}})())"
-    )
+        log("DevTools unreachable (%s)" % e); return ("unreachable", None, None)
+    if not pages:
+        return ("unreachable", None, None)
+    ws, url = pick(pages)
+    if "accounts.spotify.com" in url:
+        return ("spotify_login", ws, url)
+    expr = ("JSON.stringify((function(){try{"
+            "var a=JSON.parse(localStorage.getItem('nowify_auth_state')||'{}');"
+            "return{status:!!a.status,btn:!!document.querySelector('.authorise__button')};"
+            "}catch(e){return{status:false,btn:false};}})())")
     try:
-        raw = cdp_eval(ws, expr)
-        state = json.loads(raw) if raw else {}
+        s = json.loads(cdp_eval(ws, expr) or "{}")
     except Exception as e:
-        log(f"DevTools eval failed ({e}) -> transient")
-        return "transient"
+        log("eval failed (%s)" % e); return ("transient", ws, url)
+    if s.get("status"): return ("healthy", ws, url)
+    if s.get("btn"):    return ("nowify_loggedout", ws, url)
+    return ("transient", ws, url)
 
-    if state.get("status"):
-        return "healthy"
-    return "transient" if state.get("hasRefresh") else "expired"
+def auto_login(ws):
+    return cdp_eval(ws, "(function(){var b=document.querySelector('.authorise__button');"
+                        "if(b){b.click();return 'clicked';}return 'no-button';})()")
 
+def qr_svg(text):
+    import io, qrcode
+    import qrcode.image.svg as svg
+    b = io.BytesIO()
+    qrcode.make(text, image_factory=svg.SvgPathImage).save(b)
+    return b.getvalue().decode()
+
+def inject_qr(ws, svg, caption):
+    # built with concatenation (no % operator) so the JS '100%' literals are safe
+    js = ("(function(svg,cap){"
+      "var id='nowify-qr-overlay';"
+      "var old=document.getElementById(id); if(old) old.remove();"
+      "var d=document.createElement('div'); d.id=id; var s=d.style;"
+      "s.position='fixed'; s.left='0'; s.top='0'; s.right='0'; s.bottom='0';"
+      "s.zIndex='2147483647'; s.background='rgba(0,0,0,0.93)'; s.display='flex';"
+      "s.flexDirection='column'; s.alignItems='center'; s.justifyContent='center';"
+      "s.fontFamily='sans-serif'; s.color='#fff';"
+      "function line(t,sz,op,mb){var e=document.createElement('div');"
+      "e.style.fontSize=sz; e.style.opacity=op; e.style.marginBottom=mb;"
+      "e.style.textAlign='center'; e.textContent=t; return e;}"
+      "var q=document.createElement('div'); q.style.background='#fff';"
+      "q.style.padding='16px'; q.style.borderRadius='12px';"
+      "q.style.width='300px'; q.style.height='300px'; q.innerHTML=svg;"
+      "var qs=q.querySelector('svg'); if(qs){qs.style.width='100%'; qs.style.height='100%';}"
+      "d.appendChild(line('Spotify sign-in needed','30px','1','16px'));"
+      "d.appendChild(line('Scan to sign in from your phone','18px','0.8','24px'));"
+      "d.appendChild(q);"
+      "d.appendChild(line(cap,'14px','0.55','0'));"
+      "document.body.appendChild(d); return 'ok';"
+      "})(" + json.dumps(svg) + "," + json.dumps(caption) + ")")
+    return cdp_eval(ws, js)
+
+def novnc_url():
+    # noVNC URL drives the Pi's own screen from the phone (handles reCAPTCHA).
+    try:
+        pw = open(NOVNC_PW_FILE).read().strip()
+    except Exception:
+        pw = ""
+    u = "http://%s:%d/vnc.html?autoconnect=true&resize=scale" % (lan_ip(), NOVNC_PORT)
+    return u + ("&password=" + pw if pw else "")
+
+def show_qr(ws):
+    url = novnc_url()  # contains the VNC password; encoded in the QR but never shown as text
+    try:
+        r = inject_qr(ws, qr_svg(url), "Scan with your phone camera")
+        log("stuck on Spotify login -> QR to noVNC %s:%d (%s)" % (lan_ip(), NOVNC_PORT, r))
+    except Exception as e:
+        log("QR inject failed (%s)" % e)
 
 def restart_chromium():
-    if not RESTART_CMD:
-        log("RESTART would fire but NOWIFY_RESTART_CMD is unset — not restarting.")
-        return
-    log(f"Restarting Chromium: {RESTART_CMD}")
-    subprocess.run(RESTART_CMD, shell=True)
-
+    log("restarting chromium"); subprocess.run(RESTART_CMD, shell=True)
 
 def main():
-    state = get_state()
-    log(f"state = {state}")
+    st, ws, url = detect()
+    log("state = %s  url=%s" % (st, url))
 
-    if state in ("healthy", "expired"):
-        # expired needs a human; never loop-restart on it.
-        write_count(0)
-        return 0
+    if st == "healthy":
+        _wc(RESTART_COUNT, 0); return 0
 
-    # transient or unreachable -> count toward a restart
-    count = read_count() + 1
-    write_count(count)
-    log(f"recoverable-bad check {count}/{FAIL_THRESHOLD}")
+    if st == "nowify_loggedout":
+        # Click "Login with Spotify". If the Pi still has a Spotify session this
+        # lands us back logged in; if not, it lands on Spotify's login page and
+        # we show the QR so a phone can supply credentials.
+        log("auto re-login: %s" % auto_login(ws))
+        time.sleep(5)
+        st, ws, url = detect()
+        log("after click: state = %s" % st)
 
-    if count >= FAIL_THRESHOLD:
-        restart_chromium()
-        write_count(0)
+    if st == "spotify_login":
+        show_qr(ws); _wc(RESTART_COUNT, 0); return 0
+
+    if st == "healthy":
+        _wc(RESTART_COUNT, 0); return 0
+
+    # transient / unreachable
+    n = _rc(RESTART_COUNT) + 1; _wc(RESTART_COUNT, n)
+    log("recoverable-bad %d/%d" % (n, FAIL_THRESHOLD))
+    if n >= FAIL_THRESHOLD:
+        restart_chromium(); _wc(RESTART_COUNT, 0)
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

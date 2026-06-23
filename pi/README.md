@@ -1,82 +1,66 @@
-# Nowify kiosk watchdog (Raspberry Pi)
+# Nowify kiosk watchdog + keyboard-free recovery (Raspberry Pi)
 
-Self-heals the Pi "Now Playing" display **without** a power cycle (handy when the
-Pi runs on PoE and there's no easy switch). It restarts **Chromium only** — not
-the whole OS.
+Keeps the desk "Now Playing" display alive without a power cycle (it runs on
+PoE — no easy switch) and makes the periodic Spotify re-login doable from a
+phone instead of a keyboard.
 
-## What it does — and the one thing it deliberately won't do
+Deployed on the Pi at `192.168.0.205` (user `guntherbeam`, Raspbian 11
+bullseye, LXDE/X11). The Nowify app itself is the Netlify build
+(`scintillating-boba-a9f143.netlify.app`) shown in a Chromium kiosk — the repo
+is **not** checked out on the Pi; these scripts are copied to `~/` there.
 
-The watchdog reads Nowify's auth state out of the running Chromium kiosk over the
-DevTools Protocol and classifies it:
+## How recovery works
+
+`nowify-watchdog.py` runs every 5 min (cron) and reads kiosk state via the
+Chromium DevTools Protocol (port 9222):
 
 | State | Meaning | Action |
 | --- | --- | --- |
-| logged in / playing | working | nothing |
-| not logged in, **refresh token still stored** | transient: browser hung, boot-time network blip, mid-refresh | restart Chromium after 3 consecutive bad checks |
-| not logged in, **no refresh token** | refresh token expired/revoked (Spotify's 6‑month policy) | **nothing** |
+| `healthy` | logged in / playing | nothing |
+| `nowify_loggedout` | on Nowify's login screen (refresh token expired) | **clicks "Login with Spotify"**. If the Pi still has a Spotify session it's back instantly; if not, it lands on Spotify's login page → next row |
+| `spotify_login` | on Spotify's own login page | overlays a **QR** that opens noVNC on your phone (see below) |
+| `transient` / `unreachable` | browser hung / crashed | restarts Chromium after 3 consecutive bad checks |
 
-That last row is the important one. A restart **cannot** recover an expired
-refresh token — that needs a human to click **"Login with Spotify"** once on the
-Pi. Restarting on it would just loop forever, so the watchdog refuses to.
-(This relies on the `invalid_grant` fix in `src/components/Authorise.vue`, which
-clears the dead refresh token so "expired" is detectable.)
+It never reboot-loops on a logged-out state — those are handled by auto-login or
+the QR, not by restarts.
 
-Expect to manually re-login at the Pi roughly every 6 months. Set a reminder.
+### Why noVNC for the QR (not a login form)
 
-## Requirements
+Spotify's login is **reCAPTCHA-protected and multi-step**, so scripted
+credential entry gets bot-flagged and fails. Instead the QR opens **noVNC**:
+your phone becomes the Pi's screen and you complete the login interactively
+(handles reCAPTCHA, Google/Apple/Facebook login, anything). The VNC password is
+embedded in the QR (so scanning auto-connects) but is never rendered on screen.
 
-1. **Chromium launched with remote debugging.** Add this flag to however the
-   kiosk starts Chromium:
+Roughly every 6 months the refresh token expires; if the Pi's Spotify session
+also lapsed you'll see the QR — scan it and sign in from your phone.
 
-   ```
-   --remote-debugging-port=9222
-   ```
+## What's installed on the Pi
 
-   (Bound to localhost; the watchdog runs on the Pi itself.)
+- `~/nowify-watchdog.py` — the watchdog (cron, every 5 min).
+- Cron: `*/5 * * * * DISPLAY=:0 XAUTHORITY=/home/guntherbeam/.Xauthority /usr/bin/python3 /home/guntherbeam/nowify-watchdog.py >> ~/nowify-watchdog.log 2>&1`
+- Chromium autostart flags (in `~/.config/lxsession/LXDE-pi/autostart`):
+  `--remote-debugging-port=9222 --remote-allow-origins=*`
+- noVNC stack, also in LXDE autostart:
+  - `@x11vnc -display :0 -auth ~/.Xauthority -rfbauth ~/.vnc/passwd -forever -shared -noxdamage -o ~/x11vnc.log`
+  - `@websockify --web=/usr/share/novnc 6080 localhost:5900`
+- VNC password: `~/.vnc/passwd` (set via `x11vnc -storepasswd`); plaintext copy
+  the watchdog reads to build the QR URL at `~/.vnc/novnc_pw.txt`.
+- Packages: `python3-websocket python3-qrcode x11vnc novnc websockify`.
 
-2. **websocket-client** for Python:
+## Manual remote control anytime
 
-   ```bash
-   sudo apt install -y python3-websocket   # or: pip3 install websocket-client
-   ```
+Open `http://192.168.0.205:6080/vnc.html` on any device on the home wifi to see
+and control the Pi's screen (enter the VNC password from `~/.vnc/novnc_pw.txt`).
 
-3. This repo checked out on the Pi (paths below assume `/home/pi/Nowify`).
+## Security notes
 
-## Configure the restart command
+- noVNC / x11vnc are **LAN-only** and password-protected. Don't forward ports
+  6080/5900 to the internet.
+- Nowify ships the Spotify **client secret** in its browser bundle (it's in the
+  Pi's `localStorage` too). Consider rotating the secret and migrating to the
+  PKCE flow (no secret) — tracked separately.
 
-Set `NOWIFY_RESTART_CMD` to whatever relaunches your kiosk. Pick the one that
-matches your setup (run `pi/detect.sh` if unsure):
+## Logs
 
-- Chromium started by a **systemd system service**:
-  `sudo systemctl restart <your-kiosk-service>`
-- Chromium started by a **systemd --user service**:
-  `systemctl --user restart <your-kiosk-service>`
-- Chromium started by **autostart with no supervisor** (it won't relaunch on its
-  own, so the watchdog must relaunch it):
-  `pkill -f chromium; sleep 2; <full chromium kiosk command> &`
-
-Put it in `nowify-watchdog.service` (`Environment=NOWIFY_RESTART_CMD=...`).
-
-## Install (systemd timer, runs every 5 min)
-
-```bash
-sudo cp /home/pi/Nowify/pi/nowify-watchdog.service /etc/systemd/system/
-sudo cp /home/pi/Nowify/pi/nowify-watchdog.timer   /etc/systemd/system/
-# edit the .service to set NOWIFY_RESTART_CMD first
-sudo systemctl daemon-reload
-sudo systemctl enable --now nowify-watchdog.timer
-```
-
-Check it:
-
-```bash
-systemctl status nowify-watchdog.timer
-sudo systemctl start nowify-watchdog.service   # run once now
-journalctl -u nowify-watchdog.service -n 20
-```
-
-## Tuning (env vars in the .service)
-
-- `NOWIFY_FAIL_THRESHOLD` (default 3) — consecutive bad checks before restart.
-- `NOWIFY_DEBUG_PORT` (default 9222).
-- `NOWIFY_APP_HINT` (default `nowify`) — substring to pick the right tab.
+`~/nowify-watchdog.log`, `~/x11vnc.log`, `~/websockify.log` on the Pi.
