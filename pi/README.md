@@ -46,7 +46,10 @@ also lapsed you'll see the QR — scan it and sign in from your phone.
   - `@websockify --web=/usr/share/novnc 6080 localhost:5900`
 - VNC password: `~/.vnc/passwd` (set via `x11vnc -storepasswd`); plaintext copy
   the watchdog reads to build the QR URL at `~/.vnc/novnc_pw.txt`.
-- Packages: `python3-websocket python3-qrcode x11vnc novnc websockify`.
+- Hidden mouse cursor (Chromium otherwise leaves the pointer parked on the
+  kiosk screen, and there's no mouse to move it). Also in LXDE autostart:
+  - `@unclutter --timeout 1`  (from the `unclutter-xfixes` package)
+- Packages: `python3-websocket python3-qrcode x11vnc novnc websockify unclutter-xfixes`.
 
 ## Manual remote control anytime
 
