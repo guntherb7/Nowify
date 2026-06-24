@@ -22,7 +22,13 @@
 
 <script>
 import props from '@/utils/props.js'
-import { setStoredAuth } from '@/utils/utils.js'
+import {
+  setStoredAuth,
+  generateCodeVerifier,
+  generateCodeChallenge,
+  setCodeVerifier,
+  getCodeVerifier
+} from '@/utils/utils.js'
 
 const searchParams = new URLSearchParams()
 const currentParams = new URLSearchParams(window.location.search)
@@ -63,8 +69,8 @@ export default {
      * Spotify to grant app consent, user will
      * be redirected back to the app.
      */
-    initAuthorise() {
-      this.setAuthUrl()
+    async initAuthorise() {
+      await this.setAuthUrl()
       window.location.href = `${this.endpoints.auth}?${searchParams.toString()}`
     },
 
@@ -86,38 +92,34 @@ export default {
      * Request the initial access and refresh tokens from Spotify.
      */
     async requestAccessTokens(grantType = 'authorization_code') {
+      // PKCE flow: the client_id is sent in the body and no client secret is
+      // used. authorization_code also sends the stored code_verifier.
       let fetchData = {
-        grant_type: grantType
+        grant_type: grantType,
+        client_id: this.auth.clientId
       }
 
       if (grantType === 'authorization_code') {
-        ;(fetchData.code = this.auth.authCode),
-          (fetchData.redirect_uri = window.location.origin)
+        fetchData.code = this.auth.authCode
+        fetchData.redirect_uri = window.location.origin
+        fetchData.code_verifier = getCodeVerifier()
       }
 
       if (grantType === 'refresh_token') {
         fetchData.refresh_token = this.auth.refreshToken
       }
 
-      const queryBody = new URLSearchParams(fetchData).toString()
-
-      const clientDetails = btoa(
-        `${this.auth.clientId}:${this.auth.clientSecret}`
-      )
-
       const res = await fetch(`${this.endpoints.token}`, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: `Basic ${clientDetails}`
+          'Content-Type': 'application/x-www-form-urlencoded'
         },
-        body: queryBody
+        body: new URLSearchParams(fetchData).toString()
       })
 
       const data = await res.json()
-      const accessTokenResponse = data
 
-      this.handleAccessTokenResponse(accessTokenResponse)
+      this.handleAccessTokenResponse(data)
     },
 
     /**
@@ -188,11 +190,18 @@ export default {
      * Set the initial Spotify authorisation URL
      * in which the user will be redirected to.
      */
-    setAuthUrl() {
-      searchParams.toString()
+    async setAuthUrl() {
+      // PKCE: create a verifier, persist it for the token exchange, and send
+      // its S256 challenge on the authorize request.
+      const codeVerifier = generateCodeVerifier(64)
+      setCodeVerifier(codeVerifier)
+      const codeChallenge = await generateCodeChallenge(codeVerifier)
+
       searchParams.append('client_id', this.auth.clientId)
       searchParams.append('response_type', 'code')
       searchParams.append('redirect_uri', window.location.origin)
+      searchParams.append('code_challenge_method', 'S256')
+      searchParams.append('code_challenge', codeChallenge)
       searchParams.append(
         'state',
         [
